@@ -6,11 +6,12 @@
 namespace SziMonitor {
 
     struct SystemTelemetry {
-        std::string hostname;
-        std::string serialNumber;
-        std::string osVersion;
-        uint64_t    totalRamMb;
-        std::string agentVersion;
+        std::string hostname{};
+        std::string hardwareId{};
+        std::string machineGuid{};
+        std::string osVersion{};
+        uint64_t    totalRamMb{0};
+        std::string agentVersion{"1.2.0"};
     };
 
     class InventoryAgent {
@@ -27,11 +28,14 @@ namespace SziMonitor {
         std::string m_apiToken;
 
         std::string GetLocalHostname() const;
-        std::string GetHardwareIdentifier() const;
+        std::string GetSmbiosUuid() const;
+        std::string GetMachineGuid() const;
         std::string GetWindowsVersionString() const;
         uint64_t    GetTotalMemoryMb() const;
 
         static std::string EscapeJsonString(const std::string& input);
+        static std::wstring Utf8ToWide(const std::string& utf8Str);
+        static std::string WideToUtf8(const std::wstring& wideStr);
     };
 
 } // namespace SziMonitor
