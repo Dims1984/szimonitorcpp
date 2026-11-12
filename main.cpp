@@ -3,7 +3,9 @@
 #include <sstream>
 #include <iomanip>
 #include <vector>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -76,58 +78,129 @@ namespace SziMonitor {
             return WideToUtf8(std::wstring(buffer, size));
         }
 #endif
-        return "UNKNOWN-ENDPOINT";
+        return "";
     }
 
-    std::string InventoryAgent::GetSmbiosUuid() const {
+    std::string InventoryAgent::GetSmbiosSystemUuid() const {
 #ifdef _WIN32
-        // Query raw SMBIOS firmware table ('RSMB') for persistent motherboard UUID
         DWORD bufSize = GetSystemFirmwareTable('RSMB', 0, nullptr, 0);
-        if (bufSize > 8) {
-            std::vector<BYTE> buffer(bufSize, 0);
-            if (GetSystemFirmwareTable('RSMB', 0, buffer.data(), bufSize) == bufSize) {
-                const BYTE* p = buffer.data() + 8;
-                const BYTE* end = buffer.data() + bufSize;
-                while (p + 4 <= end) {
-                    BYTE type = p[0];
-                    BYTE length = p[1];
-                    if (length < 4 || p + length > end) break;
-                    // Type 1 is System Information, UUID is at offset 0x08 (16 bytes)
-                    if (type == 1 && length >= 0x18) {
-                        const BYTE* u = p + 8;
-                        char uuidStr[40] = {0};
-                        snprintf(uuidStr, sizeof(uuidStr),
+        if (bufSize < 8) return "";
+
+        std::vector<BYTE> buffer(bufSize, 0);
+        if (GetSystemFirmwareTable('RSMB', 0, buffer.data(), bufSize) != bufSize) {
+            return "";
+        }
+
+        // RawSMBIOSData header: byte 1 = MajorVersion, byte 2 = MinorVersion, bytes 4..7 = Length (DWORD)
+        const BYTE majorVer = buffer[1];
+        const BYTE minorVer = buffer[2];
+        DWORD tableLength = 0;
+        std::memcpy(&tableLength, buffer.data() + 4, sizeof(DWORD));
+
+        if (tableLength == 0 || tableLength > bufSize - 8) {
+            tableLength = bufSize - 8;
+        }
+
+        const BYTE* p = buffer.data() + 8;
+        const BYTE* end = p + tableLength;
+
+        while (end - p >= 4) {
+            const BYTE type = p[0];
+            const BYTE length = p[1];
+
+            if (length < 4 || end - p < length) {
+                break; // Malformed SMBIOS structure header
+            }
+
+            // Type 1 (System Information) with UUID field present (minimum length 0x18)
+            if (type == 1 && length >= 0x18) {
+                const BYTE* u = p + 8;
+                bool allZero = true;
+                bool allFF   = true;
+                for (int i = 0; i < 16; ++i) {
+                    if (u[i] != 0x00) allZero = false;
+                    if (u[i] != 0xFF) allFF   = false;
+                }
+
+                if (!allZero && !allFF) {
+                    char uuidStr[37] = {0};
+                    bool useMixedEndian = (majorVer > 2) || (majorVer == 2 && minorVer >= 6);
+                    if (useMixedEndian) {
+                        std::snprintf(uuidStr, sizeof(uuidStr),
                             "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
                             u[3], u[2], u[1], u[0], u[5], u[4], u[7], u[6],
                             u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
-                        return std::string(uuidStr);
+                    } else {
+                        std::snprintf(uuidStr, sizeof(uuidStr),
+                            "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+                            u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+                            u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
                     }
-                    p += length;
-                    while (p + 1 < end && (p[0] != 0 || p[1] != 0)) p++;
-                    p += 2;
+                    return std::string(uuidStr);
                 }
             }
+
+            // Advance past formatted section to unformatted string-set (terminated by double NUL)
+            const BYTE* strPtr = p + length;
+            bool foundDoubleNull = false;
+            while (end - strPtr >= 2) {
+                if (strPtr[0] == 0 && strPtr[1] == 0) {
+                    strPtr += 2;
+                    foundDoubleNull = true;
+                    break;
+                }
+                ++strPtr;
+            }
+
+            if (!foundDoubleNull) {
+                break; // Truncated string table, stop parsing safely
+            }
+            p = strPtr;
         }
 #endif
-        return GetMachineGuid();
+        return "";
     }
 
     std::string InventoryAgent::GetMachineGuid() const {
 #ifdef _WIN32
         HKEY hKey = nullptr;
         if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Cryptography", 0, KEY_READ | KEY_WOW64_64KEY, &hKey) == ERROR_SUCCESS) {
-            char buffer[256] = {0};
-            DWORD bufSize = sizeof(buffer) - 1;
+            char buffer[128] = {0};
+            DWORD bufSize = sizeof(buffer);
             DWORD valueType = 0;
             LSTATUS status = RegQueryValueExA(hKey, "MachineGuid", nullptr, &valueType, reinterpret_cast<LPBYTE>(buffer), &bufSize);
             RegCloseKey(hKey);
-            if (status == ERROR_SUCCESS && (valueType == REG_SZ || valueType == REG_EXPAND_SZ) && bufSize > 1) {
-                buffer[bufSize] = '\0';
-                return std::string(buffer);
+
+            // Strictly require REG_SZ and verify that a NUL terminator exists within the returned bytes
+            if (status == ERROR_SUCCESS && valueType == REG_SZ && bufSize >= 32 && bufSize <= sizeof(buffer)) {
+                const void* nullPos = std::memchr(buffer, '\0', bufSize);
+                if (nullPos != nullptr) {
+                    std::string guid(buffer);
+                    if (guid.length() >= 32 && guid.length() <= 38) {
+                        return guid;
+                    }
+                }
             }
         }
 #endif
-        return "UNIDENTIFIED-HWID";
+        return "";
+    }
+
+    HardwareIdentity InventoryAgent::ResolveHardwareIdentity() const {
+        HardwareIdentity id{};
+        id.systemUuid  = GetSmbiosSystemUuid();
+        id.machineGuid = GetMachineGuid();
+
+        if (!id.systemUuid.empty() && !id.machineGuid.empty()) {
+            id.identitySource = "smbios_uuid";
+        } else if (!id.systemUuid.empty()) {
+            id.identitySource = "smbios_uuid_only";
+        } else if (!id.machineGuid.empty()) {
+            id.identitySource = "machine_guid_fallback";
+        } else {
+            id.identitySource = "none";
+        }
+        return id;
     }
 
     std::string InventoryAgent::GetWindowsVersionString() const {
@@ -164,11 +237,10 @@ namespace SziMonitor {
     SystemTelemetry InventoryAgent::CollectTelemetry() const {
         SystemTelemetry data{};
         data.hostname     = GetLocalHostname();
-        data.hardwareId   = GetSmbiosUuid();
-        data.machineGuid  = GetMachineGuid();
+        data.identity     = ResolveHardwareIdentity();
         data.osVersion    = GetWindowsVersionString();
         data.totalRamMb   = GetTotalMemoryMb();
-        data.agentVersion = "1.2.0";
+        data.agentVersion = "1.3.0";
         return data;
     }
 
@@ -176,8 +248,10 @@ namespace SziMonitor {
         std::ostringstream json;
         json << "{\n"
              << "  \"hostname\": \"" << EscapeJsonString(data.hostname) << "\",\n"
-             << "  \"hardware_id\": \"" << EscapeJsonString(data.hardwareId) << "\",\n"
-             << "  \"machine_guid\": \"" << EscapeJsonString(data.machineGuid) << "\",\n"
+             << "  \"hardware_id\": \"" << EscapeJsonString(data.identity.GetPrimaryHardwareId()) << "\",\n"
+             << "  \"system_uuid\": \"" << EscapeJsonString(data.identity.systemUuid) << "\",\n"
+             << "  \"machine_guid\": \"" << EscapeJsonString(data.identity.machineGuid) << "\",\n"
+             << "  \"identity_source\": \"" << EscapeJsonString(data.identity.identitySource) << "\",\n"
              << "  \"os_version\": \"" << EscapeJsonString(data.osVersion) << "\",\n"
              << "  \"total_ram_mb\": " << data.totalRamMb << ",\n"
              << "  \"agent_version\": \"" << EscapeJsonString(data.agentVersion) << "\"\n"
@@ -197,27 +271,44 @@ namespace SziMonitor {
         urlComp.dwStructSize = sizeof(urlComp);
         wchar_t hostName[256] = {0};
         wchar_t urlPath[1024] = {0};
+        wchar_t extraInfo[1024] = {0};
         urlComp.lpszHostName = hostName;
         urlComp.dwHostNameLength = _countof(hostName);
         urlComp.lpszUrlPath = urlPath;
         urlComp.dwUrlPathLength = _countof(urlPath);
+        urlComp.lpszExtraInfo = extraInfo;
+        urlComp.dwExtraInfoLength = _countof(extraInfo);
 
         if (!WinHttpCrackUrl(wideUrl.c_str(), static_cast<DWORD>(wideUrl.length()), 0, &urlComp)) {
             std::cerr << "[ERROR] Invalid endpoint URL format (WinHttpCrackUrl error: " << GetLastError() << ").\n";
             return false;
         }
 
-        // Enforce HTTPS only to protect Bearer token in transit
         if (urlComp.nScheme != INTERNET_SCHEME_HTTPS) {
             std::cerr << "[SECURITY] Plaintext HTTP is rejected. Endpoint must use HTTPS.\n";
             return false;
         }
 
-        HINTERNET hSession = WinHttpOpen(L"SziMonitorAgent/1.2", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-        if (!hSession) return false;
+        // Preserve both path and query string (e.g., /api.php?tenant=company1)
+        std::wstring fullRequestTarget(urlComp.lpszUrlPath, urlComp.dwUrlPathLength);
+        if (urlComp.dwExtraInfoLength > 0) {
+            fullRequestTarget.append(urlComp.lpszExtraInfo, urlComp.dwExtraInfoLength);
+        }
+        if (fullRequestTarget.empty()) {
+            fullRequestTarget = L"/";
+        }
 
-        // Configure strict timeouts (resolve: 5s, connect: 5s, send: 10s, receive: 10s)
-        WinHttpSetTimeouts(hSession, 5000, 5000, 10000, 10000);
+        HINTERNET hSession = WinHttpOpen(L"SziMonitorAgent/1.3", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) {
+            std::cerr << "[ERROR] WinHttpOpen failed (code: " << GetLastError() << ").\n";
+            return false;
+        }
+
+        if (!WinHttpSetTimeouts(hSession, 5000, 5000, 10000, 10000)) {
+            std::cerr << "[ERROR] WinHttpSetTimeouts failed (code: " << GetLastError() << ").\n";
+            WinHttpCloseHandle(hSession);
+            return false;
+        }
 
         HINTERNET hConnect = WinHttpConnect(hSession, urlComp.lpszHostName, urlComp.nPort, 0);
         if (!hConnect) {
@@ -226,18 +317,33 @@ namespace SziMonitor {
             return false;
         }
 
-        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", urlComp.lpszUrlPath, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", fullRequestTarget.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
         if (!hRequest) {
+            std::cerr << "[ERROR] WinHttpOpenRequest failed (code: " << GetLastError() << ").\n";
             WinHttpCloseHandle(hConnect);
             WinHttpCloseHandle(hSession);
             return false;
         }
 
-        // Disable automatic redirects to prevent Bearer token leakage to untrusted origins
+        // Fail-closed if disabling redirects fails
         DWORD disableRedirects = WINHTTP_DISABLE_REDIRECTS;
-        WinHttpSetOption(hRequest, WINHTTP_OPTION_DISABLE_FEATURE, &disableRedirects, sizeof(disableRedirects));
+        if (!WinHttpSetOption(hRequest, WINHTTP_OPTION_DISABLE_FEATURE, &disableRedirects, sizeof(disableRedirects))) {
+            std::cerr << "[SECURITY] Failed to disable HTTP redirects (code: " << GetLastError() << "). Aborting.\n";
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            return false;
+        }
 
         std::wstring wideToken = Utf8ToWide(m_apiToken);
+        if (wideToken.empty()) {
+            std::cerr << "[ERROR] API token UTF-8 conversion failed.\n";
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            return false;
+        }
+
         std::wstring headers = L"Authorization: Bearer " + wideToken + L"\r\nContent-Type: application/json; charset=utf-8\r\n";
 
         BOOL bResults = WinHttpSendRequest(
@@ -261,7 +367,9 @@ namespace SziMonitor {
         DWORD statusCode = 0;
         DWORD statusCodeSize = sizeof(statusCode);
         if (WinHttpReceiveResponse(hRequest, nullptr)) {
-            WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX);
+            if (!WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX)) {
+                std::cerr << "[ERROR] WinHttpQueryHeaders failed (code: " << GetLastError() << ").\n";
+            }
         } else {
             std::cerr << "[ERROR] WinHttpReceiveResponse failed (code: " << GetLastError() << ").\n";
         }
@@ -294,10 +402,16 @@ int main(int argc, char* argv[]) {
 
     SziMonitor::InventoryAgent agent(envEndpoint, envToken);
     auto telemetry = agent.CollectTelemetry();
-    std::string payload = agent.BuildJsonPayload(telemetry);
 
+    // Fail-closed: never send shared placeholder IDs if hardware/OS identification fails
+    if (telemetry.hostname.empty() || !telemetry.identity.IsValid()) {
+        std::cerr << "[CRITICAL] Failed to resolve valid endpoint hostname or hardware identity. Aborting sync.\n";
+        return 3;
+    }
+
+    std::string payload = agent.BuildJsonPayload(telemetry);
     if (agent.SyncWithServer(payload)) {
-        std::cout << "[OK] Endpoint telemetry synchronized successfully.\n";
+        std::cout << "[OK] Endpoint telemetry synchronized (source: " << telemetry.identity.identitySource << ").\n";
         return 0;
     }
 
