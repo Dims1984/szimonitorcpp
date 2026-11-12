@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <cstdint>
 
 namespace SziMonitor {
 
@@ -8,6 +9,7 @@ namespace SziMonitor {
         std::string hostname;
         std::string serialNumber;
         std::string osVersion;
+        uint64_t    totalRamMb;
         std::string agentVersion;
     };
 
@@ -16,13 +18,8 @@ namespace SziMonitor {
         InventoryAgent(const std::string& endpointUrl, const std::string& apiToken);
         ~InventoryAgent() = default;
 
-        // Collects basic hardware and OS telemetry
         SystemTelemetry CollectTelemetry() const;
-
-        // Formats telemetry into a JSON payload
         std::string BuildJsonPayload(const SystemTelemetry& data) const;
-
-        // Sends payload to the central synchronization API
         bool SyncWithServer(const std::string& jsonPayload) const;
 
     private:
@@ -30,8 +27,11 @@ namespace SziMonitor {
         std::string m_apiToken;
 
         std::string GetLocalHostname() const;
-        std::string GetMotherboardUuid() const;
+        std::string GetHardwareIdentifier() const;
         std::string GetWindowsVersionString() const;
+        uint64_t    GetTotalMemoryMb() const;
+
+        static std::string EscapeJsonString(const std::string& input);
     };
 
 } // namespace SziMonitor
